@@ -7,7 +7,7 @@ import java.net.Socket;
 import javax.swing.*;
 
 /**
- * Client graphique Swing/AWT amélioré.
+ * Client graphique Swing/AWT amélioré.F
  * - Peut être instancié manuellement (UI) ou via MainMenu pour auto-connexion.
  * - Si autoConnect = true : se connecte immédiatement avec le pseudo et le mode fournis.
  *
@@ -254,8 +254,7 @@ public class BattleshipClientAWT extends JFrame {
             }
         }
 
-        // Si le serveur annonce un tir ennemi avec coordonnées (x,y)
-        // ex: "Votre bateau a été touché en (2,3)" ou "Tir ennemi en (2,3) raté !"
+
         int p1 = msg.indexOf('(');
         int p2 = msg.indexOf(')');
         if (p1 >= 0 && p2 > p1) {

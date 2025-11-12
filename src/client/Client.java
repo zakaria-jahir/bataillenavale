@@ -1,52 +1,60 @@
 package client;
 
 import java.io.*;
-import java.net.Socket;
+import java.net.*;
 import java.util.Scanner;
 
 /**
- * Client console minimal pour se connecter au serveur.
- * Utilisation :
- *  - run Client.main()
- *  - suivre les messages du serveur et envoyer commandes (pseudo, mode, tir x y)
+ * Client Bataille Navale (TCP)
+ * - Se connecte automatiquement à un serveur prédéfini (IP + port)
+ * - Ne demande plus à l'utilisateur de saisir l'adresse
  */
 public class Client {
-    private static final String SERVER_HOST = "localhost";
+
+    // -----------------------------
+    // 🧭 CONFIGURATION STATIQUE
+    // -----------------------------
+    private static final String SERVER_HOST = "172.20.10.3";
     private static final int SERVER_PORT = 1234;
 
     public static void main(String[] args) {
+        System.out.println("🔵 Client Bataille Navale");
+        System.out.println("Connexion au serveur " + SERVER_HOST + ":" + SERVER_PORT + " ...");
+
         try (Socket socket = new Socket(SERVER_HOST, SERVER_PORT);
              BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
              PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
              Scanner scanner = new Scanner(System.in)) {
 
-            System.out.println("Connecté au serveur " + SERVER_HOST + ":" + SERVER_PORT);
+            System.out.println("✅ Connecté au serveur.");
 
-            // Thread d'écoute des messages serveur
+            // Thread pour écouter les messages du serveur
             Thread listener = new Thread(() -> {
                 try {
-                    String serverMsg;
-                    while ((serverMsg = in.readLine()) != null) {
-                        System.out.println("[Serveur] " + serverMsg);
+                    String line;
+                    while ((line = in.readLine()) != null) {
+                        System.out.println("[Serveur] " + line);
                     }
                 } catch (IOException e) {
-                    System.out.println("Connexion fermée.");
+                    System.out.println("❌ Connexion fermée : " + e.getMessage());
                 }
             });
             listener.setDaemon(true);
             listener.start();
 
-            // Boucle d'envoi : envoie ce que tape l'utilisateur (pseudo, choix mode, commandes)
+            // Interaction utilisateur simple (envoyer pseudo et commandes)
             while (true) {
-                if (!scanner.hasNextLine()) break;
-                String line = scanner.nextLine();
-                out.println(line);
-                if (line.equalsIgnoreCase("quit") || line.equalsIgnoreCase("exit")) break;
+                String input = scanner.nextLine();
+                out.println(input);
+                if (input.equalsIgnoreCase("quit")) {
+                    System.out.println("👋 Déconnexion...");
+                    break;
+                }
             }
 
-            System.out.println("Client terminé.");
         } catch (IOException e) {
-            System.err.println("Impossible de se connecter au serveur : " + e.getMessage());
+            System.err.println("❌ Erreur de connexion au serveur : " + e.getMessage());
+            System.err.println("Vérifie que le serveur est bien lancé et que l'adresse IP est correcte.");
         }
     }
 }
