@@ -7,27 +7,27 @@ import java.util.*;
 public class Server {
 
     private static final int PORT = 1234;
-    private static final int SIZE = 4; // grille 4x4
+    private static final int SIZE = 4;
 
     private static final List<ClientHandler> waitingPlayers = new ArrayList<>();
 
     public static void main(String[] args) {
-        System.out.println("🟢 Serveur Bataille Navale lancé sur " + PORT);
-
+        System.out.println("=== Serveur Bataille Navale ===");
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+
             while (true) {
                 Socket socket = serverSocket.accept();
-                System.out.println("Connexion : " + socket.getInetAddress());
                 new Thread(new ClientHandler(socket)).start();
             }
+
         } catch (IOException e) {
-            System.err.println("Erreur Serveur : " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
-    // -------------------------------------------------------------------
-    //                           CLIENT HANDLER
-    // -------------------------------------------------------------------
+    //------------------------------------------------------------------------
+    // CLIENT HANDLER
+    //------------------------------------------------------------------------
 
     static class ClientHandler implements Runnable {
 
@@ -38,84 +38,47 @@ public class Server {
         private String pseudo;
         private ClientHandler opponent;
         private IAHandler ia;
-
         private boolean vsIA = false;
         private boolean myTurn = false;
         private boolean gameOver = false;
 
-        private int[][] myGrid = new int[SIZE][SIZE];     // bateaux du joueur
-        private int[][] enemyGrid = new int[SIZE][SIZE];  // bateaux adverses
+        private final int[][] myGrid = new int[SIZE][SIZE];
+        private int[][] enemyGrid;
 
-        public ClientHandler(Socket socket) {
-            this.socket = socket;
+        public ClientHandler(Socket s) {
+            this.socket = s;
         }
 
         @Override
         public void run() {
-
             try {
 
                 in  = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 out = new PrintWriter(socket.getOutputStream(), true);
 
-                // demander pseudo
-                out.println("Entrez votre pseudo :");
+                send("MSG|Entrez votre pseudo :");
                 pseudo = in.readLine();
-                if (pseudo == null) return;
 
-                out.println("Bonjour " + pseudo + " !");
-                out.println("Choisissez un mode :");
-                out.println("1 - Jouer contre un autre joueur");
-                out.println("2 - Jouer contre l'IA");
-                out.println("Tapez 1 ou 2 :");
+                send("MSG|Bonjour " + pseudo);
+                send("MSG|Choisissez un mode");
+                send("MSG|1 = Joueur vs Joueur");
+                send("MSG|2 = Joueur vs IA");
+                send("ASKMODE");
+
+                placeBoatsRandom(myGrid);
 
                 String mode = in.readLine();
                 if (mode == null) return;
 
-                // préparer la grille du joueur
-                placeBoatsRandom(myGrid);
-
-                // MODE IA
                 if (mode.equals("2")) {
-                    vsIA = true;
-                    ia = new IAHandler(this);
-                    enemyGrid = ia.myGrid;
-
-                    out.println("Vous jouez contre l'IA !");
-                    out.println("Vous commencez !");
-                    myTurn = true;
+                    startVsIA();
+                } else {
+                    startVsPlayer();
                 }
 
-                // MODE JvJ
-                else {
-                    synchronized (waitingPlayers) {
-                        if (waitingPlayers.isEmpty()) {
-                            waitingPlayers.add(this);
-                            out.println("En attente d'un adversaire...");
-                        } else {
-                            opponent = waitingPlayers.remove(0);
-                            opponent.opponent = this;
-
-                            // Copier les grilles adverses
-                            opponent.enemyGrid = this.myGrid;
-                            this.enemyGrid    = opponent.myGrid;
-
-                            out.println("Partie trouvée ! Vous affrontez " + opponent.pseudo);
-                            opponent.out.println("Partie trouvée ! Vous affrontez " + pseudo);
-
-                            out.println("Vous commencez !");
-                            opponent.out.println("Votre adversaire commence.");
-
-                            myTurn = true;
-                            opponent.myTurn = false;
-                        }
-                    }
-                }
-
-                // boucle principale
-                String cmd;
-                while ((cmd = in.readLine()) != null) {
-                    process(cmd);
+                String line;
+                while ((line = in.readLine()) != null) {
+                    process(line);
                 }
 
             } catch (Exception e) {
@@ -125,198 +88,212 @@ public class Server {
             }
         }
 
-        // -------------------------------------------------------------------
-        //                           LOGIQUE DE TIR
-        // -------------------------------------------------------------------
+        //------------------------------------------------------------------------
+        // MATCHMAKING
+        //------------------------------------------------------------------------
 
-        private void process(String cmd) {
+        private void startVsIA() {
+            vsIA = true;
+            ia = new IAHandler(this);
+            enemyGrid = ia.myGrid;
+
+            send("MSG|Partie contre l’IA !");
+            send("TURN|YOU");
+            myTurn = true;
+        }
+
+        private void startVsPlayer() {
+            synchronized (waitingPlayers) {
+                if (waitingPlayers.isEmpty()) {
+                    waitingPlayers.add(this);
+                    send("MSG|En attente d'un adversaire...");
+                } else {
+                    opponent = waitingPlayers.remove(0);
+                    opponent.opponent = this;
+
+                    this.enemyGrid = opponent.myGrid;
+                    opponent.enemyGrid = this.myGrid;
+
+                    send("MSG|Adversaire trouvé : " + opponent.pseudo);
+                    opponent.send("MSG|Adversaire trouvé : " + this.pseudo);
+
+                    send("TURN|YOU");
+                    opponent.send("TURN|OPP");
+
+                    myTurn = true;
+                    opponent.myTurn = false;
+                }
+            }
+        }
+
+        //------------------------------------------------------------------------
+        // GESTION TIRS
+        //------------------------------------------------------------------------
+
+        private void process(String msg) {
             if (gameOver) return;
 
-            // quitter
-            if (cmd.equalsIgnoreCase("quit")) {
-                gameOver = true;
-                return;
-            }
-
-            // tir x y
-            if (cmd.startsWith("tir")) {
-
-                if (!myTurn) {
-                    out.println("Ce n'est pas votre tour !");
+            if (msg.startsWith("SHOT")) {
+                String[] p = msg.split("\\|");
+                if (p.length != 3) {
+                    send("ERROR|Format tir invalide");
                     return;
                 }
 
-                String[] parts = cmd.split(" ");
-                if (parts.length != 3) return;
+                if (!myTurn) {
+                    send("ERROR|Pas votre tour");
+                    return;
+                }
 
-                int x = Integer.parseInt(parts[1]);
-                int y = Integer.parseInt(parts[2]);
+                int x = Integer.parseInt(p[1]);
+                int y = Integer.parseInt(p[2]);
 
                 handleShot(x, y);
             }
         }
 
         private void handleShot(int x, int y) {
-
             int cell = enemyGrid[x][y];
-            String result;
 
-            if (cell == 0) { // eau
-                enemyGrid[x][y] = -1; // tir raté
-                result = "💦 Manqué";
+            if (cell == -1 || cell == 2) {
+                send("ERROR|Case déjà jouée");
+                return;
             }
-            else if (cell == 1) { // bateau intact
-                enemyGrid[x][y] = 2; // touché
+
+            if (cell == 0) {
+                enemyGrid[x][y] = -1;
+                send("RESULT|MISS|" + x + "|" + y);
+                nextTurn();
+                return;
+            }
+
+            if (cell == 1) {
+                enemyGrid[x][y] = 2;
+
                 if (isShipSunk(enemyGrid, x, y)) {
-                    result = "🔥 Coulé";
+                    send("RESULT|SUNK|" + x + "|" + y);
                 } else {
-                    result = "💥 Touché";
+                    send("RESULT|HIT|" + x + "|" + y);
                 }
-            }
-            else { // déjà tiré
-                out.println("Case déjà jouée !");
-                return;
-            }
 
-            out.println("→ Vous tirez : " + result);
+                if (isAllShipsDestroyed(enemyGrid)) {
+                    send("END|WIN");
+                    if (!vsIA)
+                        opponent.send("END|LOSE");
 
-            // check victoire
-            if (isAllShipsDestroyed(enemyGrid)) {
-                gameOver = true;
-                out.println("🏆 VICTOIRE ! Tous les bateaux ennemis sont coulés.");
-                if (!vsIA)
-                    opponent.out.println("💀 DÉFAITE ! Tous vos bateaux sont coulés.");
-                return;
+                    gameOver = true;
+                    return;
+                }
+
+                nextTurn();
             }
+        }
 
-            // tour de l'autre maintenant
+        private void nextTurn() {
             myTurn = false;
 
             if (vsIA) {
                 ia.play();
-            } else {
-                opponent.myTurn = true;
-                opponent.out.println("C'est votre tour !");
+                return;
             }
+
+            opponent.myTurn = true;
+            opponent.send("TURN|YOU");
+            send("TURN|OPP");
         }
 
-        // -------------------------------------------------------------------
-        //                        PLACEMENT BATEAUX 2X2
-        // -------------------------------------------------------------------
+        //------------------------------------------------------------------------
+        // OUTILS
+        //------------------------------------------------------------------------
 
-        private void placeBoatsRandom(int[][] grid) {
-            for (int i = 0; i < 2; i++) { // 2 bateaux
-                boolean placed = false;
-                while (!placed) {
+        private void send(String s) {
+            out.println(s);
+        }
 
-                    int x = (int)(Math.random() * SIZE);
-                    int y = (int)(Math.random() * SIZE);
-                    boolean horizontal = Math.random() < 0.5;
-
-                    if (horizontal && y <= SIZE-2) {
-                        if (grid[x][y] == 0 && grid[x][y+1] == 0) {
-                            grid[x][y] = grid[x][y+1] = 1;
-                            placed = true;
-                        }
+        private void placeBoatsRandom(int[][] g) {
+            for (int k=0; k<2; k++) {
+                boolean ok = false;
+                while (!ok) {
+                    int x = (int)(Math.random()*SIZE);
+                    int y = (int)(Math.random()*SIZE);
+                    boolean h = Math.random() < 0.5;
+                    if (h && y < SIZE-1 && g[x][y]==0 && g[x][y+1]==0) {
+                        g[x][y]=g[x][y+1]=1;
+                        ok=true;
                     }
-                    else if (!horizontal && x <= SIZE-2) {
-                        if (grid[x][y] == 0 && grid[x+1][y] == 0) {
-                            grid[x][y] = grid[x+1][y] = 1;
-                            placed = true;
-                        }
+                    else if (!h && x < SIZE-1 && g[x][y]==0 && g[x+1][y]==0) {
+                        g[x][y]=g[x+1][y]=1;
+                        ok=true;
                     }
                 }
             }
         }
 
-        // -------------------------------------------------------------------
-        //                     DETECTION COULÉ / FIN
-        // -------------------------------------------------------------------
-
-        private boolean isShipSunk(int[][] grid, int x, int y) {
-            // Cherche les voisins touchés
-            int[][] dirs = { {1,0}, {-1,0}, {0,1}, {0,-1} };
-
-            for (int[] d : dirs) {
-                int nx = x + d[0];
-                int ny = y + d[1];
-                if (nx >= 0 && nx < SIZE && ny >=0 && ny < SIZE) {
-                    if (grid[nx][ny] == 1) {
-                        return false; // partie intacte → pas coulé
-                    }
+        private boolean isShipSunk(int[][] g, int x, int y) {
+            int[][] d = {{1,0},{-1,0},{0,1},{0,-1}};
+            for (int[] a : d) {
+                int nx=x+a[0], ny=y+a[1];
+                if (nx>=0 && nx<SIZE && ny>=0 && ny<SIZE) {
+                    if (g[nx][ny] == 1) return false;
                 }
             }
             return true;
         }
 
-        private boolean isAllShipsDestroyed(int[][] grid) {
-            for (int i = 0; i < SIZE; i++)
-                for (int j = 0; j < SIZE; j++)
-                    if (grid[i][j] == 1)
-                        return false;
+        private boolean isAllShipsDestroyed(int[][] g) {
+            for (int[] row : g)
+                for (int c : row)
+                    if (c == 1) return false;
             return true;
         }
     }
 
-    // -------------------------------------------------------------------
-    //                          IA HANDLER
-    // -------------------------------------------------------------------
+    //------------------------------------------------------------------------
+    // IA
+    //------------------------------------------------------------------------
 
     static class IAHandler {
-
         private final ClientHandler human;
         public int[][] myGrid = new int[SIZE][SIZE];
 
-        public IAHandler(ClientHandler human) {
-            this.human = human;
+        public IAHandler(ClientHandler h) {
+            human = h;
             human.placeBoatsRandom(myGrid);
         }
 
         public void play() {
             new Thread(() -> {
 
-                try { Thread.sleep(800); } catch (Exception ignored) {}
+                try { Thread.sleep(700); } catch (Exception ignored) {}
 
-                if (human.gameOver) return;
-
-                // Tir IA = case aléatoire
                 int x, y;
-                while (true) {
+                do {
                     x = (int)(Math.random()*SIZE);
                     y = (int)(Math.random()*SIZE);
-                    if (human.myGrid[x][y] >= 0) break;
-                }
+                } while (human.myGrid[x][y] == -1 || human.myGrid[x][y] == 2);
 
                 int cell = human.myGrid[x][y];
-                String result;
 
                 if (cell == 0) {
                     human.myGrid[x][y] = -1;
-                    result = "a manqué 💦";
-                }
-                else if (cell == 1) {
+                    human.send("RESULT|MISS|" + x + "|" + y);
+                } else if (cell == 1) {
                     human.myGrid[x][y] = 2;
 
                     if (human.isShipSunk(human.myGrid, x, y))
-                        result = "vous a coulé 🔥";
+                        human.send("RESULT|SUNK|" + x + "|" + y);
                     else
-                        result = "vous a touché 💥";
-                }
-                else {
-                    result = "a manqué 💦";
+                        human.send("RESULT|HIT|" + x + "|" + y);
                 }
 
-                human.out.println("🤖 IA : " + result);
-
-                // Vérifier défaite
                 if (human.isAllShipsDestroyed(human.myGrid)) {
-                    human.out.println("💀 DÉFAITE ! Tous vos bateaux sont coulés.");
+                    human.send("END|LOSE");
                     human.gameOver = true;
                     return;
                 }
 
                 human.myTurn = true;
-                human.out.println("C'est votre tour !");
+                human.send("TURN|YOU");
 
             }).start();
         }

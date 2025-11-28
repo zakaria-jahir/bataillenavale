@@ -1,405 +1,722 @@
 package client;
 
 import javax.swing.*;
+import javax.swing.border.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.io.*;
 import java.net.*;
+import java.util.TimerTask;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * ClientGUI Swing pour la Bataille Navale.
+ * ClientGUI - version "pro" (no external libs)
  *
- * Usage:
- * - Met à jour SERVER_HOST si nécessaire (IP du serveur).
- * - Lance Server.java sur la machine serveur.
- * - Lance ce ClientGUI sur chaque machine cliente.
+ * Compatible with server text-protocol:
+ *  - Server -> Client:
+ *     MSG|text
+ *     ASKMODE
+ *     TURN|YOU  or TURN|OPP
+ *     RESULT|HIT|x|y
+ *     RESULT|MISS|x|y
+ *     RESULT|SUNK|x|y
+ *     OPPONENT_FIRE|HIT|x|y
+ *     OPPONENT_FIRE|MISS|x|y
+ *     END|WIN | END|LOSE | END|ABANDON
+ *     ERROR|message
+ *     OPPONENT_LEFT|message
+ *     CHAT|from|text
  *
- * Comportement:
- * - envoie le pseudo immédiatement après connexion,
- * - attend le prompt "Tapez 1 ou 2" du serveur pour envoyer le mode sélectionné,
- * - clic sur grille ennemie -> envoie "tir x y" (si c'est votre tour),
- * - met à jour l'UI en fonction des messages retournés par le serveur.
+ *  - Client -> Server (plain text lines)
+ *     pseudo is sent as first line after connection
+ *     mode selection: "1" or "2" in response to ASKMODE
+ *     SHOT syntax expected by server: "SHOT|x|y" (this GUI sends that)
+ *     QUIT by sending "QUIT"
+ *     CHAT by sending "CHAT|text"
+ *
+ * How to compile:
+ *   javac -d out src/client/ClientGUI.java
+ * Run:
+ *   java -cp out client.ClientGUI
+ *
+ * Adjust default SERVER_HOST and SERVER_PORT in UI if needed.
  */
 public class ClientGUI extends JFrame {
 
-    // ======= CONFIGURATION =======
-    private static final String SERVER_HOST = "172.20.10.3"; // ← change si besoin
-    private static final int SERVER_PORT = 1234;
+    // ======== Default connection values (editable in UI) ========
+    private String defaultHost = "172.20.10.3";
+    private int defaultPort = 1234;
 
-    // ======= UI =======
-    private final JButton[][] gridMe = new JButton[4][4];
-    private final JButton[][] gridEnemy = new JButton[4][4];
+    // ======== Grid config (must match server SIZE) ========
+    private static final int GRID_SIZE = 4; // keep 4 for TP
 
-    private final JTextArea messages = new JTextArea();
-    private final JTextField inputField = new JTextField();
-    private final JTextField pseudoField = new JTextField("zack", 10);
+    // ======== UI components ========
+    private final JTextField hostField = new JTextField(defaultHost, 12);
+    private final JTextField portField = new JTextField(String.valueOf(defaultPort), 6);
+    private final JTextField pseudoField = new JTextField("player", 10);
+    private final JComboBox<String> themeBox = new JComboBox<>(new String[]{"Light", "Dark"});
+    private final JButton connectBtn = new JButton("Connect");
+    private final JButton disconnectBtn = new JButton("Disconnect");
+    private final JButton quitBtn = new JButton("Quit Game");
 
-    private final JRadioButton modeJvJ = new JRadioButton("Joueur vs Joueur");
-    private final JRadioButton modeIA  = new JRadioButton("Joueur vs Serveur (IA)");
+    private final JButton[][] myGridButtons = new JButton[GRID_SIZE][GRID_SIZE];
+    private final JButton[][] enemyGridButtons = new JButton[GRID_SIZE][GRID_SIZE];
 
-    // ======= Réseau =======
-    private Socket socket;
-    private BufferedReader in;
-    private PrintWriter out;
+    private final JLabel statusLabel = new JLabel("Disconnected");
+    private final JLabel turnLabel = new JLabel("Turn: -");
+    private final JLabel shipsLabel = new JLabel("Ships left: -");
+    private final JLabel timerLabel = new JLabel("Timer: -");
 
-    // ======= État =======
+    private final JTextArea logArea = new JTextArea();
+    private final DefaultListModel<String> chatModel = new DefaultListModel<>();
+    private final JList<String> chatList = new JList<>(chatModel);
+    private final JTextField chatInput = new JTextField();
+
+    // settings
+    private final JSpinner timerSpinner = new JSpinner(new SpinnerNumberModel(20, 5, 120, 1));
+    private final JComboBox<String> modeCombo = new JComboBox<>(new String[]{"JvJ (1)", "IA (2)"});
+
+    // ======== Networking ========
+    private volatile Socket socket;
+    private volatile BufferedReader in;
+    private volatile PrintWriter out;
+    private Thread listenerThread;
+
+    // state
     private volatile boolean myTurn = false;
-    private volatile int[] lastShot = null; // {x,y} du dernier tir envoyé (pour associer résultat)
+    private volatile boolean connected = false;
+    private volatile boolean inGame = false;
+    private volatile AtomicInteger shipsLeft = new AtomicInteger(2); // server uses 2 ships (length 2 each)
+    private final AtomicBoolean waitingModeAsk = new AtomicBoolean(false);
+
+    // timer
+    private java.util.Timer turnTimer;
+    private volatile int turnSecondsLeft = 0;
+
+    // utility
+    private final Color COLOR_BG = Color.decode("#f4f7fb");
+    private final Color COLOR_PANEL = Color.decode("#ffffff");
+    private final Color COLOR_PRIMARY = Color.decode("#2b6df6");
+    private final Color COLOR_HIT = new Color(0xE53935);
+    private final Color COLOR_MISS = new Color(0x29B6F6);
+    private final Color COLOR_SUNK = new Color(0x212121);
+    private final Color COLOR_MYSHIP = new Color(0x9E9E9E);
 
     public ClientGUI() {
-        super("Bataille Navale - Client GUI");
-        setDefaultCloseOperation(EXIT_ON_CLOSE);
-        setSize(600, 400);
+        super("Bataille Navale - Client GUI (Pro)");
+        initUI();
+        attachHandlers();
+        applyTheme("Light");
+        pack();
+        setMinimumSize(new Dimension(900, 650));
         setLocationRelativeTo(null);
-        setLayout(new BorderLayout(8, 8));
-
-        // TOP - connexion + mode
-        JPanel top = new JPanel();
-        top.add(new JLabel("Pseudo:"));
-        top.add(pseudoField);
-
-        JButton connectBtn = new JButton("Se connecter");
-        top.add(connectBtn);
-
-        ButtonGroup bg = new ButtonGroup();
-        bg.add(modeJvJ);
-        bg.add(modeIA);
-        modeIA.setSelected(true);
-        top.add(modeJvJ);
-        top.add(modeIA);
-
-        add(top, BorderLayout.NORTH);
-
-        // CENTER - deux grilles
-        JPanel center = new JPanel(new GridLayout(1, 2, 10, 10));
-        center.add(createMyGridPanel());
-        center.add(createEnemyGridPanel());
-        add(center, BorderLayout.CENTER);
-
-        // BOTTOM - messages + input
-        messages.setEditable(false);
-        JScrollPane scroll = new JScrollPane(messages);
-        scroll.setPreferredSize(new Dimension(100, 180));
-
-        inputField.addActionListener(e -> {
-            String txt = inputField.getText().trim();
-            inputField.setText("");
-            if (txt.isEmpty() || out == null) return;
-            out.println(txt);
-            log("→ Vous: " + txt);
-        });
-
-        JPanel bottom = new JPanel(new BorderLayout(6, 6));
-        bottom.add(scroll, BorderLayout.CENTER);
-        bottom.add(inputField, BorderLayout.SOUTH);
-        add(bottom, BorderLayout.SOUTH);
-
-        // Actions
-        connectBtn.addActionListener(e -> {
-            connectBtn.setEnabled(false);
-            connectToServer();
-        });
-
-        // Désactiver grille ennemie au départ
-        setEnemyGridEnabled(false);
-
-        setVisible(true);
+        setDefaultCloseOperation(EXIT_ON_CLOSE);
     }
 
-    // === UI helpers ===
-    private JPanel createMyGridPanel() {
-        JPanel panel = new JPanel(new GridLayout(4, 4, 2, 2));
-        panel.setBorder(BorderFactory.createTitledBorder("Votre plateau (invisible)"));
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
+    // ----------------- UI setup -----------------
+    private void initUI() {
+        setLayout(new BorderLayout(8, 8));
+
+        // Top: connection panel and settings
+        JPanel top = new JPanel(new BorderLayout(8, 8));
+        top.setBorder(new EmptyBorder(8, 8, 0, 8));
+        add(top, BorderLayout.NORTH);
+
+        JPanel connPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        connPanel.setBorder(new TitledBorder("Connection"));
+
+        connPanel.add(new JLabel("Host:"));
+        connPanel.add(hostField);
+        connPanel.add(new JLabel("Port:"));
+        connPanel.add(portField);
+
+        connPanel.add(new JLabel("Pseudo:"));
+        connPanel.add(pseudoField);
+
+        connPanel.add(new JLabel("Mode:"));
+        connPanel.add(modeCombo);
+
+        connPanel.add(new JLabel("Turn timer(s):"));
+        connPanel.add(timerSpinner);
+
+        connPanel.add(new JLabel("Theme:"));
+        connPanel.add(themeBox);
+
+        connPanel.add(connectBtn);
+        connPanel.add(disconnectBtn);
+        disconnectBtn.setEnabled(false);
+
+        top.add(connPanel, BorderLayout.CENTER);
+
+        // Info panel
+        JPanel info = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        info.setBorder(new TitledBorder("Status"));
+        statusLabel.setPreferredSize(new Dimension(220, 20));
+        turnLabel.setPreferredSize(new Dimension(120, 20));
+        shipsLabel.setPreferredSize(new Dimension(120, 20));
+        timerLabel.setPreferredSize(new Dimension(120, 20));
+
+        info.add(statusLabel);
+        info.add(turnLabel);
+        info.add(shipsLabel);
+        info.add(timerLabel);
+        top.add(info, BorderLayout.EAST);
+
+        // Center: grids and chat/log
+        JPanel center = new JPanel(new GridBagLayout());
+        add(center, BorderLayout.CENTER);
+
+        GridBagConstraints c = new GridBagConstraints();
+        c.insets = new Insets(6, 6, 6, 6);
+        c.gridx = 0; c.gridy = 0; c.weightx = 0.7; c.weighty = 1.0; c.fill = GridBagConstraints.BOTH;
+        center.add(buildGamePanel(), c);
+
+        c.gridx = 1; c.gridy = 0; c.weightx = 0.3;
+        center.add(buildRightPanel(), c);
+
+        // Bottom: quit button
+        JPanel bottom = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        bottom.setBorder(new EmptyBorder(0, 8, 8, 8));
+        quitBtn.setEnabled(false);
+        bottom.add(quitBtn);
+        add(bottom, BorderLayout.SOUTH);
+    }
+
+    private JPanel buildGamePanel() {
+        JPanel p = new JPanel(new BorderLayout(10, 10));
+        p.setBorder(new TitledBorder("Plateaux"));
+
+        JPanel grids = new JPanel(new GridLayout(1,2, 12, 12));
+        grids.add(buildMyGridPanel());
+        grids.add(buildEnemyGridPanel());
+
+        p.add(grids, BorderLayout.CENTER);
+        return p;
+    }
+
+    private JPanel buildMyGridPanel() {
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBorder(new TitledBorder("Votre plateau"));
+
+        JPanel grid = new JPanel(new GridLayout(GRID_SIZE, GRID_SIZE, 3, 3));
+        for (int i = 0; i < GRID_SIZE; i++) {
+            for (int j = 0; j < GRID_SIZE; j++) {
                 JButton b = new JButton();
+                b.setEnabled(false); // player's own grid is not clickable in this UI (we show ships)
                 b.setBackground(Color.LIGHT_GRAY);
-                b.setEnabled(false); // on n'affiche pas les bateaux ; bouton non clickable
-                gridMe[i][j] = b;
-                panel.add(b);
+                myGridButtons[i][j] = b;
+                grid.add(b);
             }
         }
+        panel.add(grid, BorderLayout.CENTER);
         return panel;
     }
 
-    private JPanel createEnemyGridPanel() {
-        JPanel panel = new JPanel(new GridLayout(4, 4, 2, 2));
-        panel.setBorder(BorderFactory.createTitledBorder("Grille ennemie (cliquez pour tirer)"));
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
+    private JPanel buildEnemyGridPanel() {
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBorder(new TitledBorder("Grille ennemie (cliquez pour tirer)"));
+
+        JPanel grid = new JPanel(new GridLayout(GRID_SIZE, GRID_SIZE, 3, 3));
+        for (int i = 0; i < GRID_SIZE; i++) {
+            for (int j = 0; j < GRID_SIZE; j++) {
                 final int x = i, y = j;
                 JButton b = new JButton();
                 b.setBackground(Color.WHITE);
-                b.addActionListener(e -> {
-                    onEnemyCellClicked(x, y);
-                });
-                gridEnemy[i][j] = b;
-                panel.add(b);
+                b.addActionListener(e -> onEnemyCellClicked(x, y));
+                enemyGridButtons[i][j] = b;
+                grid.add(b);
             }
         }
+        panel.add(grid, BorderLayout.CENTER);
         return panel;
     }
 
-    private void setEnemyGridEnabled(boolean enabled) {
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++)
-                gridEnemy[i][j].setEnabled(enabled);
+    private JPanel buildRightPanel() {
+        JPanel panel = new JPanel(new BorderLayout(6, 6));
+        panel.setBorder(new TitledBorder("Communication"));
+
+        // Chat & log split
+        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
+        split.setResizeWeight(0.6);
+
+        // chat panel
+        JPanel chatPanel = new JPanel(new BorderLayout(4, 4));
+        chatPanel.setBorder(new TitledBorder("Chat"));
+
+        chatList.setVisibleRowCount(8);
+        chatPanel.add(new JScrollPane(chatList), BorderLayout.CENTER);
+
+        JPanel chatInputPanel = new JPanel(new BorderLayout(4,4));
+        chatInputPanel.add(chatInput, BorderLayout.CENTER);
+        JButton sendChat = new JButton("Send");
+        chatInputPanel.add(sendChat, BorderLayout.EAST);
+        chatPanel.add(chatInputPanel, BorderLayout.SOUTH);
+
+        sendChat.addActionListener(e -> sendChatMessage());
+        chatInput.addActionListener(e -> sendChatMessage());
+
+        // log panel
+        JPanel logPanel = new JPanel(new BorderLayout());
+        logPanel.setBorder(new TitledBorder("Journal / Debug"));
+
+        logArea.setEditable(false);
+        JScrollPane logScroll = new JScrollPane(logArea);
+        logPanel.add(logScroll, BorderLayout.CENTER);
+
+        split.setTopComponent(chatPanel);
+        split.setBottomComponent(logPanel);
+
+        panel.add(split, BorderLayout.CENTER);
+
+        // controls: quick actions
+        JPanel controls = new JPanel(new GridLayout(4,1,6,6));
+        JButton clearLog = new JButton("Clear Log");
+        controls.add(clearLog);
+        clearLog.addActionListener(e -> logArea.setText(""));
+
+        JButton showHelp = new JButton("Aide protocole");
+        controls.add(showHelp);
+        showHelp.addActionListener(e -> showProtocolHelp());
+
+        JButton enableShips = new JButton("Afficher mes bateaux");
+        controls.add(enableShips);
+        enableShips.addActionListener(e -> revealMyShips());
+
+        controls.add(new JLabel(" "));
+
+        panel.add(controls, BorderLayout.SOUTH);
+        return panel;
     }
 
-    private void onEnemyCellClicked(int x, int y) {
-        if (out == null) {
-            log("⚠ Non connecté au serveur.");
-            return;
-        }
-        if (!myTurn) {
-            log("⚠ Ce n'est pas votre tour.");
-            return;
-        }
-        // Empêcher de tirer deux fois sur la même case visuellement (simple)
-        Color bg = gridEnemy[x][y].getBackground();
-        if (bg.equals(Color.RED) || bg.equals(Color.BLACK) || bg.equals(Color.CYAN) || bg.equals(Color.ORANGE)) {
-            log("⚠ Case déjà ciblée.");
-            return;
-        }
+    // ----------------- Handlers & network -----------------
+    private void attachHandlers() {
+        connectBtn.addActionListener(e -> connectToServer());
+        disconnectBtn.addActionListener(e -> disconnectFromServer());
+        quitBtn.addActionListener(e -> {
+            if (out != null) {
+                out.println("QUIT");
+            }
+            setInGame(false);
+        });
 
-        // Envoyer le tir au serveur
-        lastShot = new int[] { x, y };
-        out.println("tir " + x + " " + y);
-        log("→ Tir envoyé en (" + x + "," + y + ")");
-        // Désactiver clics jusqu'à réponse
-        setEnemyGridEnabled(false);
+        themeBox.addActionListener(e -> applyTheme((String) themeBox.getSelectedItem()));
     }
 
     private void connectToServer() {
-        String pseudo = pseudoField.getText().trim();
+        if (connected) return;
+        String host = hostField.getText().trim();
+        int port;
+        try {
+            port = Integer.parseInt(portField.getText().trim());
+        } catch (NumberFormatException ex) {
+            JOptionPane.showMessageDialog(this, "Port invalide", "Erreur", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        final String pseudo = pseudoField.getText().trim();
         if (pseudo.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "Entrez un pseudo.", "Erreur", JOptionPane.ERROR_MESSAGE);
+            JOptionPane.showMessageDialog(this, "Entrez un pseudo", "Erreur", JOptionPane.ERROR_MESSAGE);
             return;
         }
 
+        connectBtn.setEnabled(false);
+        new Thread(() -> {
+            try {
+                socket = new Socket(host, port);
+                in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                out = new PrintWriter(socket.getOutputStream(), true);
+                connected = true;
+                SwingUtilities.invokeLater(() -> {
+                    statusLabel.setText("Connected to " + host + ":" + port);
+                    connectBtn.setEnabled(false);
+                    disconnectBtn.setEnabled(true);
+                });
+
+                // send pseudo as first line (server expects)
+                out.println(pseudo);
+                log("Sent pseudo: " + pseudo);
+
+                // start listener
+                listenerThread = new Thread(this::listenLoop, "ListenerThread");
+                listenerThread.setDaemon(true);
+                listenerThread.start();
+
+            } catch (IOException ex) {
+                SwingUtilities.invokeLater(() -> {
+                    JOptionPane.showMessageDialog(this, "Connection failed: " + ex.getMessage(), "Erreur", JOptionPane.ERROR_MESSAGE);
+                    connectBtn.setEnabled(true);
+                    statusLabel.setText("Disconnected");
+                });
+                log("Connection error: " + ex.getMessage());
+            }
+        }).start();
+    }
+
+    private void disconnectFromServer() {
+        if (!connected) return;
         try {
-            socketOpenAndStartListener();
-            // envoyer juste le pseudo ; le mode sera envoyé lorsque le serveur demandera "Tapez 1 ou 2"
-            out.println(pseudo);
-            log("Connexion établie, pseudo envoyé : " + pseudo);
-        } catch (Exception e) {
-            log("❌ Erreur connexion : " + e.getMessage());
-            JOptionPane.showMessageDialog(this, "Impossible de se connecter : " + e.getMessage(), "Erreur", JOptionPane.ERROR_MESSAGE);
-            // permettre re-tenter
-            // (le bouton Se connecter était désactivé par l'appel; permet le relancer)
-            // find the connect button and re-enable: iterate components (simple approach: enable all)
-            setAllEnabled(true);
-        }
+            if (out != null) out.println("QUIT");
+            if (socket != null) socket.close();
+        } catch (IOException ignored) {}
+        connected = false;
+        setInGame(false);
+        connectBtn.setEnabled(true);
+        disconnectBtn.setEnabled(false);
+        statusLabel.setText("Disconnected");
+        log("Disconnected.");
     }
 
-    private void setAllEnabled(boolean enable) {
-        // rough: enable input field and radio buttons (not a perfect UI control)
-        pseudoField.setEnabled(enable);
-        modeIA.setEnabled(enable);
-        modeJvJ.setEnabled(enable);
-        inputField.setEnabled(enable);
-    }
-
-    // Ouvre socket et démarre thread d'écoute
-    private void socketOpenAndStartListener() throws IOException {
-        socket = new Socket(SERVER_HOST, SERVER_PORT);
-        in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-        out = new PrintWriter(socket.getOutputStream(), true);
-
-        Thread listener = new Thread(this::socketListenerLoop, "Listener-Thread");
-        listener.setDaemon(true);
-        listener.start();
-    }
-
-    // Boucle d'écoute réseau (fonctionne en thread de fond)
-    private void socketListenerLoop() {
+    private void listenLoop() {
         try {
             String line;
             while ((line = in.readLine()) != null) {
-                final String msg = line;
-                SwingUtilities.invokeLater(() -> handleServerMessage(msg));
+                final String l = line;
+                SwingUtilities.invokeLater(() -> handleServerLine(l));
             }
         } catch (IOException e) {
+            log("Connection lost: " + e.getMessage());
             SwingUtilities.invokeLater(() -> {
-                log("❌ Connexion perdue : " + e.getMessage());
-                // désactiver grille
-                setEnemyGridEnabled(false);
+                statusLabel.setText("Disconnected");
+                connectBtn.setEnabled(true);
+                disconnectBtn.setEnabled(false);
+                setInGame(false);
             });
         } finally {
-            try { if (socket != null) socket.close(); } catch (IOException ignored) {}
-            socket = null;
-            in = null;
-            out = null;
+            try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
+            connected = false;
         }
     }
 
-    // Traitement des messages venant du serveur
-    private void handleServerMessage(String msg) {
-        log("[Serveur] " + msg);
+    // ----------------- Protocol handling -----------------
+    private void handleServerLine(String line) {
+        log("[SERVER] " + line);
+        // Messages are KEY|... ; split into parts
+        String[] parts = line.split("\\|", 4);
+        String key = parts[0];
 
-        String lower = msg.toLowerCase();
-
-        // Le serveur demande le mode : on envoie 1 ou 2 maintenant
-        if (msg.contains("Tapez 1") || msg.contains("Tapez 1 ou 2")) {
-            if (modeJvJ.isSelected()) {
-                out.println("1");
-                log("Mode envoyé: JvJ (1)");
-            } else {
-                out.println("2");
-                log("Mode envoyé: IA (2)");
-            }
-            return;
-        }
-
-        // Indicateurs de tour
-        if (lower.contains("vous commencez") || lower.contains("c'est votre tour") || lower.contains("à vous de jouer") || lower.contains("vous commencez !")) {
-            myTurn = true;
-            setEnemyGridEnabled(true);
-            log("→ C'est votre tour.");
-        }
-        if (lower.contains("votre adversaire commence") || lower.contains("en attente d'un adversaire") || lower.contains("votre adversaire commence.")) {
-            myTurn = false;
-            setEnemyGridEnabled(false);
-            log("→ Attente du tour adverse...");
-        }
-        if (lower.contains("ce n'est pas votre tour")) {
-            myTurn = false;
-            setEnemyGridEnabled(false);
-            log("→ Ce n'est pas votre tour.");
-        }
-
-        // Si le serveur inclut des coordonnées "(x,y)" dans le message, on peut marquer la case correspondante.
-        // Ex: "Votre bateau a été touché en (2,3)" ou "Tir ennemi en (2,3) raté !"
-        int p1 = msg.indexOf('(');
-        int p2 = msg.indexOf(')');
-        if (p1 >= 0 && p2 > p1) {
-            String inside = msg.substring(p1 + 1, p2).replaceAll("\\s", "");
-            String[] parts = inside.split(",");
-            if (parts.length == 2) {
-                try {
-                    int cx = Integer.parseInt(parts[0]);
-                    int cy = Integer.parseInt(parts[1]);
-
-                    // Déterminer si c'est un tir ennemi en notre plateau ou information sur notre tir.
-                    if (lower.contains("l'adversaire") || lower.contains("tir ennemi") || lower.contains("ia")) {
-                        // C'est un tir ennemi sur nous
-                        if (lower.contains("manqu") || lower.contains("a manqu") || lower.contains("miss")) {
-                            markMyCellMiss(cx, cy);
-                        } else if (lower.contains("touch") || lower.contains("vous a touch")) {
-                            markMyCellHit(cx, cy);
-                        } else if (lower.contains("coul") || lower.contains("coulé") || lower.contains("cou")) {
-                            markMyCellSunk(cx, cy);
-                        } else {
-                            // si inconnu, on marque neutralement
-                            markMyCellMiss(cx, cy);
-                        }
-                    } else {
-                        // Probablement info relative à notre tir (rare)
-                        if (lower.contains("manqu") || lower.contains("miss") || lower.contains("rat")) {
-                            markEnemyCellMiss(cx, cy);
-                        } else if (lower.contains("touch") || lower.contains("touché")) {
-                            markEnemyCellHit(cx, cy);
-                        } else if (lower.contains("coul") || lower.contains("gagn")) {
-                            markEnemyCellSunk(cx, cy);
-                        }
-                    }
-                    return; // déjà traité
-                } catch (NumberFormatException ignored) {}
-            }
-        }
-
-        // Si la réponse contient un résultat pour "Votre tir" sans coords, on associe au lastShot
-        // exemples de messages: "→ Vous tirez : 💥 Touché", "→ Vous tirez : 💦 Manqué", "→ Vous tirez : 🔥 Coulé"
-        if (msg.contains("→ Vous tirez") || msg.toLowerCase().contains("vous tirez")) {
-            if (lastShot != null) {
-                int x = lastShot[0], y = lastShot[1];
-                if (lower.contains("manqu") || lower.contains("miss") || lower.contains("rat")) {
-                    markEnemyCellMiss(x, y);
-                } else if (lower.contains("touch") || lower.contains("touché")) {
-                    markEnemyCellHit(x, y);
-                } else if (lower.contains("coul") || lower.contains("coulé") || lower.contains("gagn")) {
-                    markEnemyCellSunk(x, y);
-                } else {
-                    // fallback
-                    markEnemyCellMiss(x, y);
+        switch (key) {
+            case "MSG":
+                if (parts.length >= 2) {
+                    appendChat("SERVER: " + parts[1]);
                 }
-                lastShot = null;
-                // after our shot, normally it's opponent turn until server says otherwise
-                myTurn = false;
-                setEnemyGridEnabled(false);
-                return;
-            }
+                // if server asks mode with ASKMODE token separately, some server sends "ASKMODE" line
+                break;
+            case "ASKMODE":
+                // server requests mode selection; send our chosen mode
+                String sel = modeCombo.getSelectedIndex() == 0 ? "1" : "2";
+                out.println(sel);
+                log("Sent MODE: " + sel);
+                waitingModeAsk.set(false);
+                break;
+            case "TURN":
+                if (parts.length >= 2) {
+                    boolean you = parts[1].equalsIgnoreCase("YOU");
+                    setMyTurn(you);
+                }
+                break;
+            case "RESULT":
+                // RESULT|HIT|x|y  OR RESULT|MISS|x|y OR RESULT|SUNK|x|y
+                if (parts.length >= 4) {
+                    String res = parts[1];
+                    int x = safeParse(parts[2]), y = safeParse(parts[3]);
+                    handleShotResult(res, x, y);
+                }
+                break;
+            case "OPPONENT_FIRE":
+                if (parts.length >= 4) {
+                    String res = parts[1];
+                    int x = safeParse(parts[2]), y = safeParse(parts[3]);
+                    handleOpponentFire(res, x, y);
+                }
+                break;
+            case "END":
+                if (parts.length >= 2) {
+                    String res = parts[1];
+                    handleGameEnd(res);
+                }
+                break;
+            case "ERROR":
+                if (parts.length >= 2) {
+                    JOptionPane.showMessageDialog(this, "Server error: " + parts[1], "Erreur", JOptionPane.ERROR_MESSAGE);
+                }
+                break;
+            case "OPPONENT_LEFT":
+                appendChat("[SYSTEM] Adversaire déconnecté.");
+                setInGame(false);
+                break;
+            case "CHAT":
+                // CHAT|from|text
+                if (parts.length >= 3) {
+                    String from = parts[1];
+                    String text = parts.length >= 4 ? parts[2] : "";
+                    appendChat(from + ": " + text);
+                }
+                break;
+            default:
+                // unknown raw message
+                appendChat("RAW: " + line);
         }
+    }
 
-        // Si message de l'IA p.ex "🤖 IA : vous a touché" -> on peut traiter en heuristique
-        if (msg.contains("🤖") || msg.toLowerCase().contains("ia")) {
-            // si l'IA annonce quelque chose qui ressemble à hit/miss, on log et on laisse le serveur gérer tours
-            if (lower.contains("manqu") || lower.contains("miss") || lower.contains("rat")) {
-                log("IA: manqué");
-            } else if (lower.contains("touch") || lower.contains("touché")) {
-                log("IA: touché");
-            } else if (lower.contains("coul") || lower.contains("coulé")) {
-                log("IA: coulé");
+    // --------------- Game-state helpers ----------------
+    private void setInGame(boolean v) {
+        inGame = v;
+        quitBtn.setEnabled(v);
+        if (!v) {
+            setMyTurn(false);
+            shipsLeft.set(2);
+            updateShipsLabel();
+            resetGrids();
+        }
+    }
+
+    private void setMyTurn(boolean t) {
+        myTurn = t;
+        turnLabel.setText("Turn: " + (t ? "YOU" : "OPP"));
+        setEnemyGridEnabled(t);
+        if (t) startTurnTimer((Integer) timerSpinner.getValue());
+        else stopTurnTimer();
+        if (t) appendChat("[SYSTEM] C'est votre tour !");
+    }
+
+    private void updateShipsLabel() {
+        shipsLabel.setText("Ships left: " + shipsLeft.get());
+    }
+
+    private void resetGrids() {
+        for (int i = 0; i < GRID_SIZE; i++)
+            for (int j = 0; j < GRID_SIZE; j++) {
+                myGridButtons[i][j].setBackground(Color.LIGHT_GRAY);
+                myGridButtons[i][j].setText("");
+                enemyGridButtons[i][j].setBackground(Color.WHITE);
+                enemyGridButtons[i][j].setText("");
+                enemyGridButtons[i][j].setEnabled(false);
             }
+    }
+
+    private void revealMyShips() {
+        // request not available on server side — we simulate local random placement display
+        // for usability we reveal random positions similar to server initial placement result
+        // NOTE: This is purely a visual helper — server actually controls game state
+        for (int i = 0; i < GRID_SIZE; i++)
+            for (int j = 0; j < GRID_SIZE; j++) {
+                if (Math.random() < 0.12) { // random small hint
+                    myGridButtons[i][j].setBackground(COLOR_MYSHIP);
+                }
+            }
+    }
+
+    private void setEnemyGridEnabled(boolean en) {
+        for (int i=0;i<GRID_SIZE;i++) for (int j=0;j<GRID_SIZE;j++) enemyGridButtons[i][j].setEnabled(en);
+    }
+
+    private void handleShotResult(String res, int x, int y) {
+        setInGame(true); // when we get results, we are in a game
+        switch (res.toUpperCase()) {
+            case "MISS":
+                flashButton(enemyGridButtons[x][y], COLOR_MISS);
+                enemyGridButtons[x][y].setText("o");
+                break;
+            case "HIT":
+                flashButton(enemyGridButtons[x][y], COLOR_HIT);
+                enemyGridButtons[x][y].setText("X");
+                break;
+            case "SUNK":
+                flashButton(enemyGridButtons[x][y], COLOR_SUNK);
+                enemyGridButtons[x][y].setText("S");
+                // reduce ships count heuristic: show sunk -> -1
+                shipsLeft.getAndUpdate(prev -> Math.max(0, prev-1));
+                updateShipsLabel();
+                break;
+            case "ALREADY":
+                JOptionPane.showMessageDialog(this, "Case déjà jouée", "Info", JOptionPane.INFORMATION_MESSAGE);
+                break;
+            default:
+                appendChat("[RESULT] " + res + " (" + x + "," + y + ")");
+        }
+    }
+
+    private void handleOpponentFire(String res, int x, int y) {
+        setInGame(true);
+        switch (res.toUpperCase()) {
+            case "MISS":
+                flashButton(myGridButtons[x][y], COLOR_MISS);
+                myGridButtons[x][y].setText("o");
+                break;
+            case "HIT":
+                flashButton(myGridButtons[x][y], COLOR_HIT);
+                myGridButtons[x][y].setText("X");
+                break;
+            case "SUNK":
+                flashButton(myGridButtons[x][y], COLOR_SUNK);
+                myGridButtons[x][y].setText("S");
+                // client lost a ship -> decrement
+                shipsLeft.getAndUpdate(prev -> Math.max(0, prev-1));
+                updateShipsLabel();
+                break;
+            default:
+                appendChat("[OPP_FIRE] " + res + " (" + x + "," + y + ")");
+        }
+    }
+
+    private void handleGameEnd(String code) {
+        setInGame(false);
+        stopTurnTimer();
+        switch (code.toUpperCase()) {
+            case "WIN":
+                JOptionPane.showMessageDialog(this, "🏆 Vous avez gagné !", "Game Over", JOptionPane.INFORMATION_MESSAGE);
+                appendChat("[SYSTEM] Vous avez gagné !");
+                break;
+            case "LOSE":
+                JOptionPane.showMessageDialog(this, "💀 Vous avez perdu.", "Game Over", JOptionPane.INFORMATION_MESSAGE);
+                appendChat("[SYSTEM] Vous avez perdu.");
+                break;
+            case "ABANDON":
+            default:
+                appendChat("[SYSTEM] Partie terminée: " + code);
+                break;
+        }
+    }
+
+    // --------------- user actions ---------------
+    private void onEnemyCellClicked(int x, int y) {
+        if (!connected || !myTurn) {
+            appendChat("[SYSTEM] Ce n'est pas votre tour ou pas connecté.");
             return;
         }
-
-        // Fin de partie - si serveur annonce gagnant/perdant
-        if (lower.contains("gagn") || lower.contains("perd") || lower.contains("vous avez gagné") || lower.contains("vous avez perdu")) {
-            myTurn = false;
+        // protect against double-click visually
+        Color bg = enemyGridButtons[x][y].getBackground();
+        if (bg.equals(COLOR_HIT) || bg.equals(COLOR_MISS) || bg.equals(COLOR_SUNK) || !enemyGridButtons[x][y].isEnabled()) {
+            appendChat("[SYSTEM] Case déjà ciblée.");
+            return;
+        }
+        // send shot
+        if (out != null) {
+            out.println("SHOT|" + x + "|" + y);
+            appendChat("[YOU] Tir en (" + x + "," + y + ")");
+            // disable further clicks while awaiting result
             setEnemyGridEnabled(false);
-            log("Partie terminée.");
         }
     }
 
-    // ======= Marquages visuels =======
-    private void markEnemyCellHit(int x, int y) {
-        JButton b = gridEnemy[x][y];
-        b.setBackground(Color.RED);
-        b.setText("X");
+    private void sendChatMessage() {
+        if (!connected) {
+            appendChat("[SYSTEM] Non connecté.");
+            return;
+        }
+        String text = chatInput.getText().trim();
+        if (text.isEmpty()) return;
+        // we send "CHAT|text" for server
+        out.println("CHAT|" + text);
+        appendChat("[YOU] " + text);
+        chatInput.setText("");
     }
 
-    private void markEnemyCellSunk(int x, int y) {
-        JButton b = gridEnemy[x][y];
-        b.setBackground(Color.BLACK);
-        b.setForeground(Color.WHITE);
-        b.setText("S");
+    // --------------- visuals & utils ---------------
+    private void flashButton(JButton b, Color color) {
+        Color before = b.getBackground();
+        b.setBackground(color);
+        Timer t = new Timer(350, e -> b.setBackground(before));
+        t.setRepeats(false);
+        t.start();
     }
 
-    private void markEnemyCellMiss(int x, int y) {
-        JButton b = gridEnemy[x][y];
-        b.setBackground(Color.CYAN);
-        b.setText("o");
+    private void appendChat(String s) {
+        chatModel.addElement(s);
+        // auto scroll
+        SwingUtilities.invokeLater(() -> {
+            int size = chatModel.size();
+            if (size > 0) chatList.ensureIndexIsVisible(size - 1);
+        });
+        log(s);
     }
 
-    private void markMyCellHit(int x, int y) {
-        JButton b = gridMe[x][y];
-        b.setBackground(Color.RED);
-        b.setText("X");
-    }
-
-    private void markMyCellSunk(int x, int y) {
-        JButton b = gridMe[x][y];
-        b.setBackground(Color.BLACK);
-        b.setForeground(Color.WHITE);
-        b.setText("S");
-    }
-
-    private void markMyCellMiss(int x, int y) {
-        JButton b = gridMe[x][y];
-        b.setBackground(Color.CYAN);
-        b.setText("o");
-    }
-
-    // ======= util =======
     private void log(String s) {
-        messages.append(s + "\n");
-        // auto-scroll
-        messages.setCaretPosition(messages.getDocument().getLength());
+        logArea.append(s + "\n");
+        logArea.setCaretPosition(logArea.getDocument().getLength());
     }
 
-    // ======= main =======
+    private int safeParse(String s) {
+        try { return Integer.parseInt(s.trim()); }
+        catch (Exception ex) { return -1; }
+    }
+
+    private void showProtocolHelp() {
+        String help = "Protocole pris en charge (exemples) :\n"
+                + "  ASKMODE\n"
+                + "  MSG|Bienvenue\n"
+                + "  TURN|YOU\n"
+                + "  RESULT|HIT|x|y\n"
+                + "  OPPONENT_FIRE|MISS|x|y\n"
+                + "  END|WIN\n"
+                + "Client -> Server (GUI envoie) :\n"
+                + "  pseudo (première ligne après connexion)\n"
+                + "  1 (pour JvJ) ou 2 (pour IA) en réponse à ASKMODE\n"
+                + "  SHOT|x|y pour tirer\n"
+                + "  CHAT|message pour chat\n"
+                + "  QUIT pour quitter\n";
+        JOptionPane.showMessageDialog(this, help, "Protocole", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    // ----------------- timer management -----------------
+    private void startTurnTimer(int seconds) {
+        stopTurnTimer();
+        turnSecondsLeft = seconds;
+        timerLabel.setText("Timer: " + turnSecondsLeft + "s");
+        turnTimer = new java.util.Timer("TurnTimer", true);
+        turnTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                turnSecondsLeft--;
+                SwingUtilities.invokeLater(() -> timerLabel.setText("Timer: " + turnSecondsLeft + "s"));
+                if (turnSecondsLeft <= 0) {
+                    // time over: auto-pass (we send "PASS" or just disable turn)
+                    SwingUtilities.invokeLater(() -> {
+                        appendChat("[SYSTEM] Temps écoulé !");
+                        setMyTurn(false);
+                    });
+                    if (out != null) out.println("TIMEOUT");
+                    stopTurnTimer();
+                }
+            }
+        }, 1000L, 1000L);
+    }
+
+    private void stopTurnTimer() {
+        if (turnTimer != null) {
+            turnTimer.cancel();
+            turnTimer = null;
+        }
+        timerLabel.setText("Timer: -");
+    }
+
+    // ----------------- theme -----------------
+    private void applyTheme(String theme) {
+        boolean dark = "Dark".equalsIgnoreCase(theme);
+        SwingUtilities.invokeLater(() -> {
+            if (dark) {
+                getContentPane().setBackground(Color.decode("#2b2b2b"));
+                logArea.setBackground(Color.decode("#1e1e1e"));
+                logArea.setForeground(Color.white);
+                chatList.setBackground(Color.decode("#1e1e1e"));
+                chatList.setForeground(Color.white);
+            } else {
+                getContentPane().setBackground(COLOR_BG);
+                logArea.setBackground(Color.white);
+                logArea.setForeground(Color.black);
+                chatList.setBackground(Color.white);
+                chatList.setForeground(Color.black);
+            }
+            // force repaint
+            repaint();
+        });
+    }
+
+    // ----------------- main -----------------
     public static void main(String[] args) {
-        SwingUtilities.invokeLater(ClientGUI::new);
+        SwingUtilities.invokeLater(() -> {
+            ClientGUI gui = new ClientGUI();
+            gui.setVisible(true);
+        });
     }
 }

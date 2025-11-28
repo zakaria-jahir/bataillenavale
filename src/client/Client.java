@@ -6,34 +6,31 @@ import java.util.Scanner;
 
 public class Client {
 
-    private static final String SERVER_HOST = "172.20.10.3"; // IP du serveur
-    private static final int SERVER_PORT = 1234;
+    private static final String HOST = "172.20.10.3";
+    private static final int PORT = 1234;
 
     public static void main(String[] args) {
 
-        System.out.println("Connexion au serveur...");
-
-        try (Socket socket = new Socket(SERVER_HOST, SERVER_PORT);
+        try (Socket socket = new Socket(HOST, PORT);
              BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
              PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
              Scanner sc = new Scanner(System.in)) {
 
-            System.out.println("Connecté !");
+            System.out.println("Connecté au serveur.");
 
-            // Thread écoute
+            // lecture serveur
             new Thread(() -> {
                 try {
                     String line;
                     while ((line = in.readLine()) != null) {
-                        System.out.println("[Serveur] " + line);
+                        System.out.println("[SERVEUR] " + line);
                     }
                 } catch (Exception ignored) {}
             }).start();
 
-            // Entrée joueur
+            // envoi client
             while (true) {
-                String msg = sc.nextLine();
-                out.println(msg);
+                out.println(sc.nextLine());
             }
 
         } catch (Exception e) {
